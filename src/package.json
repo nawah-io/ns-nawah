@@ -1,6 +1,6 @@
 {
 	"name": "ns-nawah",
-	"version": "0.0.1",
+	"version": "0.0.3",
 	"description": "Nativescript SDK for NAWAH.",
 	"main": "ns-nawah",
 	"typings": "index.d.ts",
