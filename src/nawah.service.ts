@@ -1,3 +1,4 @@
+import { Injectable } from '@angular/core';
 import { Observable, Subject, combineLatest, interval, Subscription } from 'rxjs';
 import { webSocket } from 'rxjs/webSocket';
 require('nativescript-websockets');
@@ -6,14 +7,12 @@ import * as app from 'tns-core-modules/platform/platform';
 import { File } from 'tns-core-modules/file-system';
 
 import * as rs from 'jsrsasign';
-const JWS = rs.jws.JWS;
-
 import {
     resumeEvent, suspendEvent, ApplicationEventData, on as applicationOn, run as applicationRun
 } from "tns-core-modules/application";
-import { Injectable } from '@angular/core';
-import { SDKConfig, Res, Doc, callArgs, Session } from './lib/ns-nawah.models';
+import { SDKConfig, Res, Doc, callArgs, Session, Query } from './lib/ns-nawah.models';
 
+const JWS = rs.jws.JWS;
 
 
 @Injectable({
@@ -58,7 +57,7 @@ export class NawahService {
         this.inited$.subscribe((init) => {
             if (init) {
                 this.heartbeat$ = this.heartbeat.subscribe((i) => {
-                    this.call('heart/beat', {}).subscribe({
+                    this.call({ endpoint: 'heart/beat' }).subscribe({
                         complete: () => {
                             this.log('log', 'heart beat complete..');
                         },
@@ -99,7 +98,7 @@ export class NawahService {
 
         this.authed$.subscribe((session) => {
             if (session) {
-                if (this.queue.auth) {
+                if (this.queue.noAuth) {
                     this.log('info', 'Found calls in auth queue:', this.queue.auth);
                 }
                 for (let call of this.queue.auth) {
@@ -161,7 +160,10 @@ export class NawahService {
                 if (res.args && res.args.code == 'CORE_CONN_READY') {
                     this.reset();
                     this.config.anonToken = config.anonToken;
-                    this.call('conn/verify', {}).subscribe((res) => { }, (err) => { });
+                    this.call({
+                        endpoint: 'conn/verify',
+                        doc: { 'app': config.appId }
+                    }).subscribe((res) => { }, (err) => { });
                 } else if (res.args && res.args.code == 'CORE_CONN_OK') {
                     this.inited = true;
                     this.inited$.next(true);
@@ -189,7 +191,7 @@ export class NawahService {
                 }
             }, (err: Res<Doc>) => {
                 this.log('log', 'Received error:', err);
-                this.conn.next(err);
+                this.conn.error(err);
                 this.reset(true);
             }, () => {
                 this.log('log', 'Connection clean-closed');
@@ -200,7 +202,9 @@ export class NawahService {
     }
 
     close(): Observable<Res<Doc>> {
-        let call = this.call('conn/close', {});
+        let call = this.call({
+            endpoint: 'conn/close'
+        });
         call.subscribe((res) => { }, (err) => { });
         return call;
     }
@@ -221,13 +225,13 @@ export class NawahService {
         } catch { }
     }
 
-    call(endpoint: string, callArgs: callArgs, awaitAuth: boolean = false): Observable<Res<Doc>> {
+    call(callArgs: callArgs): Observable<Res<Doc>> {
 
         callArgs.sid = (this.authed) ? callArgs.sid || this.cache.get('sid') || 'f00000000000000000000012' : callArgs.sid || 'f00000000000000000000012';
         callArgs.token = (this.authed) ? callArgs.token || this.cache.get('token') || this.config.anonToken : callArgs.token || this.config.anonToken;
         callArgs.query = callArgs.query || [];
         callArgs.doc = callArgs.doc || {};
-        callArgs.endpoint = endpoint;
+        callArgs.awaitAuth = callArgs.awaitAuth || false;
         callArgs.call_id = Math.random().toString(36).substring(7);
         this.log('log', 'callArgs', callArgs);
         let files = [];
@@ -265,7 +269,6 @@ export class NawahService {
                         androidAutoDeleteAfterUpload: false,
                         androidNotificationTitle: 'Qart Photo Uploading...',
                     };
-
                     let fileUpload: Observable<Res<Doc>> = new Observable(
                         (observer) => {
 
@@ -307,8 +310,11 @@ export class NawahService {
 
         this.log('log', 'Populated filesObservables:', filesUploads);
 
-        if ((this.inited && awaitAuth && this.authed) || (this.inited && !awaitAuth) || callArgs.endpoint == 'conn/verify') {
+        if ((this.inited && callArgs.awaitAuth && this.authed) || (this.inited && !callArgs.awaitAuth) || callArgs.endpoint == 'conn/verify') {
             combineLatest(filesUploads).subscribe({
+                error: (err) => {
+                    this.log('error', 'Received error on filesSubjects:', err);
+                },
                 complete: () => {
                     // Header
                     let oHeader = { alg: 'HS256', typ: 'JWT' };
@@ -320,13 +326,11 @@ export class NawahService {
                     let sJWT = JWS.sign('HS256', sHeader, sPayload, { utf8: callArgs.token });
                     this.log('log', 'sending request as JWT token:', callArgs, callArgs.token);
                     this.subject.next({ token: sJWT, call_id: callArgs.call_id });
-                }, error: (err) => {
-                    this.log('error', 'Received error on filesSubjects: ', err); // Specify subject for better debugging.
                 }
             });
         } else {
             this.log('warn', 'SDK not yet inited. Queuing call: ', callArgs);
-            if (awaitAuth) {
+            if (callArgs.awaitAuth) {
                 this.log('warn', 'Queuing in auth queue.');
                 this.queue.auth.push({
                     subject: filesUploads,
@@ -376,62 +380,57 @@ export class NawahService {
     }
 
     deleteWatch(watch: string | '__all'): Observable<Res<Doc>> {
-        let call = this.call('watch/delete', { query: [{ watch: watch }] });
+        let call = this.call({
+            endpoint: 'watch/delete',
+            query: [{ watch: watch }]
+        });
         call.subscribe({
             error: (err) => { this.log('error', 'deleteWatch call err:', err); }
         });
         return call;
     }
     generateAuthHash(authVar: string, authVal: string, password: string): string {
-
         if (this.config.authAttrs.indexOf(authVar) == -1 && authVar != 'token') {
             throw new Error(`Unkown authVar '${authVar}'. Accepted authAttrs: '${this.config.authAttrs.join(', ')}, token'`)
         }
-
-        if (this.config.authHashLevel != '6.1') {
-            let oHeader = { alg: 'HS256', typ: 'JWT' };
-            let sHeader = JSON.stringify(oHeader);
-            let hashObj = [authVar, authVal, password];
-            if (this.config.authHashLevel == '5.6') {
-                hashObj.push(this.config.anonToken);
-            }
-            let sPayload = JSON.stringify({ hash: hashObj });
-            let sJWT = JWS.sign('HS256', sHeader, sPayload, { utf8: password });
-            return sJWT.split('.')[1];
-        } else {
-            if (!password.match(/^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.{8,})/)) {
-                throw new Error('Password should be 8 chars, contains one lower-case char, one upper-case char, one number at least.');
-            }
-            return `${authVar}${authVal}${password}${this.config.anonToken}`;
+        if (!password.match(/^(?=.*[a-z])(?=.*[A-Z])(?=.*[0-9])(?=.{8,})/)) {
+            throw new Error('Password should be 8 chars, contains one lower-case char, one upper-case char, one number at least.');
         }
+        return `${authVar}${authVal}${password}${this.config.anonToken}`;
     }
 
-    auth(authVar: string, authVal: string, password: string): Observable<Res<Doc>> {
-
+    auth(authVar: string, authVal: string, password: string, groups?: Array<string>): Observable<Res<Doc>> {
         if (this.authed) throw new Error('User already authed.');
         if (this.config.authAttrs.indexOf(authVar) == -1) {
             throw new Error(`Unkown authVar '${authVar}'. Accepted authAttrs: '${this.config.authAttrs.join(', ')}'`);
         }
         let doc: any = { hash: this.generateAuthHash(authVar, authVal, password) };
         doc[authVar] = authVal;
-        let call = this.call('session/auth', { doc: doc });
+        if (groups && groups.length) {
+            doc.groups = groups;
+        }
+        let call = this.call({
+            endpoint: 'session/auth',
+            doc: doc
+        });
         call.subscribe({
             error: (err) => { this.log('error', 'auth call err:', err); }
         });
         return call;
     }
 
-    reauth(sid: string = this.cache.get('sid'), token: string = this.cache.get('token')): Observable<Res<Doc>> {
-        let oHeader = { alg: 'HS256', typ: 'JWT' };
-        let sHeader = JSON.stringify(oHeader);
-        let sPayload = JSON.stringify({ token: token });
-        let sJWT = JWS.sign('HS256', sHeader, sPayload, { utf8: token });
-        let call: Observable<Res<Doc>> = this.call('session/reauth', {
+    reauth(sid: string = this.cache.get('sid'), token: string = this.cache.get('token'), groups?: Array<string>): Observable<Res<Doc>> {
+        let query: Query = [
+            { _id: sid || 'f00000000000000000000012', token: token }
+        ];
+        if (groups && groups.length) {
+            query.push({ groups: groups });
+        }
+        let call: Observable<Res<Doc>> = this.call({
+            endpoint: 'session/reauth',
             sid: 'f00000000000000000000012',
             token: this.config.anonToken,
-            query: [
-                { _id: sid || 'f00000000000000000000012', token: token }
-            ]
+            query: query
         });
         call.subscribe({
             error: (err: Res<Session>) => {
@@ -450,7 +449,8 @@ export class NawahService {
 
     signout(): Observable<Res<Doc>> {
         if (!this.authed) throw new Error('User not authed.');
-        let call = this.call('session/signout', {
+        let call = this.call({
+            endpoint: 'session/signout',
             query: [
                 { _id: this.cache.get('sid') }
             ]
@@ -461,10 +461,10 @@ export class NawahService {
         return call;
     }
 
-    checkAuth(): Observable<Res<Doc>> {
+    checkAuth(groups?: Array<string>): Observable<Res<Doc>> {
         this.log('log', 'attempting checkAuth');
         if (!this.cache.get('token') || !this.cache.get('sid')) throw new Error('No credentials cached.');
-        let call = this.reauth(this.cache.get('sid'), this.cache.get('token'));
+        let call = this.reauth(this.cache.get('sid'), this.cache.get('token'), groups);
         return call;
     }
 }
